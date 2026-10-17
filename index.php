@@ -1,11 +1,12 @@
 <?php
 require __DIR__ . '/config.php';
 
+start_board_session();        // must run before any output
+$voter = voter_id();
+session_write_close();        // release the session file lock; $_SESSION stays readable
+
 $errors = [];
 $old    = ['title' => '', 'description' => '', 'category' => 'Feature'];
-
-// IDs this browser already upvoted (stored in a cookie, so each browser = one "user")
-$voted = array_values(array_filter(array_map('intval', explode(',', input_str($_COOKIE, 'voted')))));
 
 // ---------- Handle form submissions (POST) ----------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -39,6 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'description' => $entry['description'],
                     'category'    => $entry['category'],
                     'votes'       => 0,
+                    'voters'      => [],
                     'created'     => gmdate('c'),
                     'instance'    => instance_name(),
                 ];
@@ -52,24 +54,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'upvote') {
         $id = (int)input_str($_POST, 'id', '0');
-        if ($id > 0 && !in_array($id, $voted, true)) {
-            $found = false;
-            update_requests(function ($items) use ($id, &$found) {
+        if ($id > 0 && $voter !== '') {
+            // The "already voted?" check happens inside the file lock, on the server
+            update_requests(function ($items) use ($id, $voter) {
                 foreach ($items as &$r) {
                     if ((int)$r['id'] === $id) {
-                        $r['votes']++;
-                        $found = true;
+                        $voters = $r['voters'] ?? [];
+                        if (!in_array($voter, $voters, true)) {
+                            $voters[]    = $voter;
+                            $r['voters'] = $voters;
+                            $r['votes']  = (int)$r['votes'] + 1;
+                        }
+                        break;
                     }
                 }
                 unset($r);
                 return $items;
             });
-            if ($found) {
-                $voted[] = $id;
-                setcookie('voted', implode(',', $voted), time() + 30 * 86400, '/');
-            }
         }
-        // Go back to the same search/filter view
         header('Location: ' . board_url([
             'q'        => input_str($_POST, 'q'),
             'category' => input_str($_POST, 'category'),
@@ -145,7 +147,7 @@ page_header('Board');
   <p class="muted">No requests to show.</p>
 <?php endif; ?>
 
-<?php foreach ($items as $r): $already = in_array((int)$r['id'], $voted, true); ?>
+<?php foreach ($items as $r): $already = in_array($voter, $r['voters'] ?? [], true); ?>
   <article class="card item">
     <form method="post" action="index.php" class="vote">
       <input type="hidden" name="action" value="upvote">

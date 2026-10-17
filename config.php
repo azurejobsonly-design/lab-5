@@ -3,7 +3,6 @@
 
 const CATEGORIES = ['Feature', 'Bug', 'Question', 'Other'];
 
-// Read an environment variable (App Service app settings arrive this way)
 function env_value(string $name, string $default = ''): string
 {
     $v = getenv($name);
@@ -13,7 +12,6 @@ function env_value(string $name, string $default = ''): string
     return ($v === '' || $v === false) ? $default : (string)$v;
 }
 
-// Read a plain string from $_GET / $_POST / $_COOKIE safely
 function input_str(array $source, string $key, string $default = ''): string
 {
     $v = $source[$key] ?? $default;
@@ -25,14 +23,25 @@ function h(string $s): string
     return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
 }
 
-function app_version(): string  { return env_value('APP_VERSION', '1.0'); }
+function app_version(): string   { return env_value('APP_VERSION', '1.0'); }
 function instance_name(): string { return gethostname() ?: 'unknown'; }
 function instance_id(): string   { return env_value('WEBSITE_INSTANCE_ID', 'unset'); }
 
-// Where the data lives. Default = local temp folder of the current machine/container.
+// Default: /home/board-data if /home is writable (shared on App Service Linux, to be verified
+// in Part 2 step 4), otherwise the local temp folder (e.g. your own PC).
+function default_data_dir(): string
+{
+    if (is_dir('/home') && is_writable('/home')) {
+        return '/home/board-data';
+    }
+    return sys_get_temp_dir() . '/board-data';
+}
+
+// To reproduce the "local storage" problem on purpose, set the app setting
+// DATA_DIR=/tmp/board-data
 function data_dir(): string
 {
-    $dir = env_value('DATA_DIR', sys_get_temp_dir() . '/board-data');
+    $dir = env_value('DATA_DIR', default_data_dir());
     if (!is_dir($dir)) {
         @mkdir($dir, 0775, true);
     }
@@ -44,7 +53,38 @@ function data_file(): string
     return data_dir() . '/requests.json';
 }
 
-// Read all requests (shared lock)
+// Sessions are stored next to the data, so they are shared exactly when the data is shared.
+function start_board_session(): void
+{
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $path = data_dir() . '/sessions';
+    if (!is_dir($path)) {
+        @mkdir($path, 0775, true);
+    }
+    if (is_dir($path) && is_writable($path)) {
+        session_save_path($path);
+    }
+    $https = !empty($_SERVER['HTTPS']) || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'secure'   => $https,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+    session_start();
+    if (empty($_SESSION['voter_id'])) {
+        $_SESSION['voter_id'] = bin2hex(random_bytes(8));
+    }
+}
+
+function voter_id(): string
+{
+    return (string)($_SESSION['voter_id'] ?? '');
+}
+
 function load_requests(): array
 {
     $file = data_file();
@@ -63,8 +103,6 @@ function load_requests(): array
     return is_array($data) ? $data : [];
 }
 
-// Read -> change -> write, all under one exclusive lock.
-// $change receives the array and must return the new array.
 function update_requests(callable $change): bool
 {
     $fh = @fopen(data_file(), 'c+');
@@ -86,7 +124,6 @@ function update_requests(callable $change): bool
     return true;
 }
 
-// Search + category filter + sorting (used by the page AND the API)
 function filter_requests(array $items, string $q, string $category, string $sort): array
 {
     if ($q !== '') {
@@ -102,10 +139,17 @@ function filter_requests(array $items, string $q, string $category, string $sort
 
     if ($sort === 'newest') {
         usort($items, fn($a, $b) => $b['id'] <=> $a['id']);
-    } else { // default: most votes first, newer first on ties
+    } else {
         usort($items, fn($a, $b) => [$b['votes'], $b['id']] <=> [$a['votes'], $a['id']]);
     }
     return $items;
+}
+
+// Remove private fields (voter IDs) before showing a request in the API
+function public_request(array $r): array
+{
+    unset($r['voters']);
+    return $r;
 }
 
 function board_url(array $params = []): string
@@ -114,7 +158,6 @@ function board_url(array $params = []): string
     return 'index.php' . ($params ? '?' . http_build_query($params) : '');
 }
 
-// Info block used by the API (and handy for debugging)
 function api_meta(): array
 {
     return [
@@ -156,6 +199,8 @@ function page_footer(): void
   Instance: <strong><?= h(instance_name()) ?></strong>
   &middot; Instance ID: <?= h(substr(instance_id(), 0, 12)) ?>
   &middot; Version: <strong><?= h(app_version()) ?></strong>
+  &middot; Storage: <?= h(data_dir()) ?>
+  &middot; Voter: <?= h(substr(voter_id() ?: 'none', 0, 6)) ?>
   &middot; Rendered: <?= h(gmdate('H:i:s')) ?> UTC
 </footer>
 </body>
